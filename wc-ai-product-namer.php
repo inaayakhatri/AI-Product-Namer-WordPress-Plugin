@@ -2,13 +2,23 @@
 /**
  * Plugin Name: WooCommerce AI Product Name Suggester (Gemini - Free)
  * Description: Suggests a product name based on the Featured Image and the theme of your existing product names, using Google Gemini's free API.
- * Version: 1.2
+ * Version: 1.3
  * Author: Custom
+ * Plugin URI: https://example.com/ai-product-namer
+ * Requires at least: 6.5
+ * Tested up to: 6.6
+ * Requires PHP: 7.4
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
+
+if ( defined( 'WCANS_PLUGIN_LOADED' ) ) {
+    return;
+}
+
+define( 'WCANS_PLUGIN_LOADED', true );
 
 /**
  * ---------------------------------------------------
@@ -87,8 +97,6 @@ function wcans_render_meta_box( $post ) {
             </p>
         <?php endif; ?>
 
-        <p style="color:#666;font-size:12px;">Pick any photo</p>
-
         <button type="button" id="wcans-pick-image-btn" class="button" style="width:100%;margin-bottom:8px;">
             📷 Select Image for Naming
         </button>
@@ -109,7 +117,6 @@ function wcans_render_meta_box( $post ) {
             <button type="button" id="wcans-use-name-btn" class="button button-primary" style="width:100%;margin-bottom:6px;">✅ Use this name</button>
             <div style="display:flex;gap:6px;">
                 <button type="button" id="wcans-pending-name-btn" class="button" style="flex:1;">🕒 Add to Pending</button>
-                <button type="button" id="wcans-reject-name-btn" class="button" style="flex:1;">❌ Reject</button>
             </div>
             <p id="wcans-status-msg" style="margin-top:6px;display:none;color:#2271b1;"></p>
         </div>
@@ -119,14 +126,17 @@ function wcans_render_meta_box( $post ) {
 
         <hr style="margin:14px 0;" />
 
-        <p style="font-weight:600;margin-bottom:6px;">📋 Pending Names</p>
-        <div id="wcans-pending-inline-list" style="margin-bottom:10px;">
-            <p class="wcans-empty-msg" style="color:#666;font-size:12px;">Loading…</p>
+        <div style="display:flex;gap:6px;margin-bottom:8px;">
+            <button type="button" id="wcans-show-pending-btn" class="button button-small" style="flex:1;">
+                📋 Pending Names
+            </button>
         </div>
 
-        <p style="font-weight:600;margin-bottom:6px;">❌ Rejected Names <span style="font-weight:normal;font-size:11px;color:#666;">(reference)</span></p>
-        <div id="wcans-rejected-inline-list" style="margin-bottom:6px;">
-            <p class="wcans-empty-msg" style="color:#666;font-size:12px;">Loading…</p>
+        <div id="wcans-pending-section" style="display:none;margin-bottom:10px;">
+            <p style="font-weight:600;margin-bottom:6px;">📋 Pending Names</p>
+            <div id="wcans-pending-inline-list">
+                <p class="wcans-empty-msg" style="color:#666;font-size:12px;">None</p>
+            </div>
         </div>
     </div>
     <?php
@@ -156,7 +166,7 @@ function wcans_enqueue_scripts( $hook ) {
         'wcans-script',
         plugin_dir_url( __FILE__ ) . 'wcans-admin.js',
         array( 'jquery' ),
-        '1.2',
+        filemtime( plugin_dir_path( __FILE__ ) . 'wcans-admin.js' ),
         true
     );
 
@@ -179,6 +189,27 @@ function wcans_enqueue_scripts( $hook ) {
  * "I couldn't do it" filler the model sometimes returns instead
  * of an actual name.
  */
+function wcans_is_ai_limit_error( $message ) {
+    $lower = mb_strtolower( (string) $message );
+
+    return false !== strpos( $lower, 'quota' )
+        || false !== strpos( $lower, 'limit' )
+        || false !== strpos( $lower, 'rate limit' )
+        || false !== strpos( $lower, '429' );
+}
+
+function wcans_get_gemini_error_message( $response_body, $response_code ) {
+    if ( is_array( $response_body ) && isset( $response_body['error']['message'] ) && is_string( $response_body['error']['message'] ) && '' !== trim( $response_body['error']['message'] ) ) {
+        return trim( $response_body['error']['message'] );
+    }
+
+    if ( is_array( $response_body ) && isset( $response_body['error']['status'] ) && is_string( $response_body['error']['status'] ) && '' !== trim( $response_body['error']['status'] ) ) {
+        return trim( $response_body['error']['status'] );
+    }
+
+    return 'Gemini API error (HTTP ' . (int) $response_code . ')';
+}
+
 function wcans_is_valid_name( $name ) {
     $name = trim( (string) $name );
 
@@ -211,6 +242,62 @@ function wcans_is_valid_name( $name ) {
 }
 
 /**
+ * Ensure the requested attachment is actually usable for the current product.
+ * The image must be an existing attachment that the current user can edit,
+ * and if a product ID is supplied it must either be that product's featured
+ * image or an image attached to that product.
+ */
+function wcans_can_use_attachment_for_post( $attachment_id, $post_id ) {
+    $attachment_id = absint( $attachment_id );
+    $post_id = absint( $post_id );
+
+    if ( ! $attachment_id ) {
+        return false;
+    }
+
+    if ( ! current_user_can( 'edit_post', $attachment_id ) ) {
+        return false;
+    }
+
+    if ( ! $post_id ) {
+        return true;
+    }
+
+    if ( ! current_user_can( 'edit_post', $post_id ) ) {
+        return false;
+    }
+
+    $attachment_parent = (int) wp_get_post_parent_id( $attachment_id );
+    $featured_image_id = (int) get_post_thumbnail_id( $post_id );
+
+    if ( $attachment_parent && $attachment_parent !== $post_id && $attachment_id !== $featured_image_id ) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Remove a name from an option and verify that the persisted value no longer contains it.
+ */
+function wcans_remove_name_from_option( $option_key, $name ) {
+    $list = get_option( $option_key, array() );
+    if ( ! is_array( $list ) ) {
+        $list = array();
+    }
+
+    $updated_list = array_values( array_diff( $list, array( $name ) ) );
+    update_option( $option_key, $updated_list, false );
+
+    $verify = get_option( $option_key, array() );
+    if ( ! is_array( $verify ) ) {
+        return false;
+    }
+
+    return ! in_array( $name, $verify, true );
+}
+
+/**
  * ---------------------------------------------------
  * 5. AJAX handler: analyze image + suggest name via Gemini
  * ---------------------------------------------------
@@ -223,12 +310,16 @@ function wcans_suggest_name() {
         wp_send_json_error( 'Not allowed' );
     }
 
-    $post_id = isset( $_POST['post_id'] ) ? intval( $_POST['post_id'] ) : 0;
-    $attachment_id = isset( $_POST['attachment_id'] ) ? intval( $_POST['attachment_id'] ) : 0;
+    $post_id = isset( $_POST['post_id'] ) ? absint( wp_unslash( $_POST['post_id'] ) ) : 0;
+    $attachment_id = isset( $_POST['attachment_id'] ) ? absint( wp_unslash( $_POST['attachment_id'] ) ) : 0;
     $api_key = get_option( 'wcans_gemini_api_key' );
 
     if ( ! $api_key ) {
         wp_send_json_error( 'No API key configured. Go to Settings > AI Product Namer.' );
+    }
+
+    if ( $post_id && ! current_user_can( 'edit_post', $post_id ) ) {
+        wp_send_json_error( 'Not allowed' );
     }
 
     // Fall back to the Featured Image if no attachment was explicitly picked
@@ -238,6 +329,10 @@ function wcans_suggest_name() {
 
     if ( ! $attachment_id ) {
         wp_send_json_error( 'No image selected. Click "Select Image for Naming" first.' );
+    }
+
+    if ( ! wcans_can_use_attachment_for_post( $attachment_id, $post_id ) ) {
+        wp_send_json_error( 'Invalid image selection.' );
     }
 
     // Validate the attachment actually is a media-library image attachment,
@@ -296,17 +391,19 @@ function wcans_suggest_name() {
     }
     $rejected_names_text = ! empty( $rejected_names ) ? implode( "\n- ", array_slice( $rejected_names, 0, 15 ) ) : '(No rejected names yet.)';
 
-    $prompt = "You are a naming assistant for a clothing store. Always return one usable product name. Never reply with placeholder or refusal text such as 'no name', 'not available', 'N/A', 'unknown', 'unable', or anything equivalent. Never return a single letter, an initial, or an abbreviation.\n\n"
-        . "Use the style of the existing product names and the pending names below as your main theme guide. Do not imitate the rejected names below; avoid them entirely.\n\n"
+    $system_prompt = "You are a naming assistant for a clothing store. Train on previous product names and pending names to match their tone, length, and style. Treat rejected names as negative examples and never suggest anything that matches, is too similar, or is based on them. Do not suggest any name that is already in the pending list, the rejected list, or existing product titles. Return exactly one short, sellable, Urdu or Hindi name written in Roman letters. Never return a single letter, an initial, an abbreviation, or placeholder text. If the image is unclear, still return a plausible marketable name.";
+
+    $prompt = "Study the attached image and the naming history below. Create one fresh product name that fits the tone, length, and style of the existing, pending, and rejected names. Train on previous product names and pending names, and use rejected names only as negative examples to avoid.\n\n"
         . "Existing product names:\n- " . $titles_text . "\n\n"
         . "Pending names (theme guide):\n- " . $pending_names_text . "\n\n"
         . "Rejected names (do not use):\n- " . $rejected_names_text . "\n\n"
-        . "Look at the attached image of a clothing item. Suggest ONE product name for it that matches the style and theme of the existing and pending names above (word choice, tone, length, poetic/descriptive style, etc.). If there are no existing names, create a clean, appealing, sellable name based on the image.\n\n"
+        . "Look at the attached image of a clothing item. Suggest ONE product name for it that matches the style and theme of the existing and pending names above (word choice, tone, length, poetic/descriptive style, etc.), while avoiding any rejected names or names that are too similar to them. Do not suggest any name that already appears exactly in the existing product list, pending names, or rejected names. If there are no existing names, create a clean, appealing, sellable name based on the image.\n\n"
         . "STRICT RULES for the name:\n"
         . "- Use real Urdu or Hindi word(s), written in English/Roman letters (for example: 'Gulabi', 'Noor', 'Sitara', 'Anaar'), not English words.\n"
         . "- Every word MUST be a real, complete, recognizable Urdu/Hindi word with at least 2 letters. NEVER respond with a single letter, an initial, or an abbreviation.\n"
         . "- Always produce an actual name, even for a plain or hard-to-describe image.\n"
         . "- The name should be a real, recognizable Urdu/Hindi word or short phrase, not gibberish.\n"
+        . "- Do not suggest any name that is just one letter, a single-character word, or a near-duplicate of a rejected or existing name.\n"
         . "- You may reference the color(s) of the item in the image using an Urdu/Hindi color word if it fits naturally.\n"
         . "- Keep it short (1-3 words), sellable, and easy for an English-speaking customer to read and pronounce.\n\n"
         . "Respond with ONLY the product name text, in Roman/English letters. No quotes, no explanation, no punctuation at the end.";
@@ -316,6 +413,11 @@ function wcans_suggest_name() {
     $endpoint = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key=" . rawurlencode( $api_key );
 
     $body = array(
+        'systemInstruction' => array(
+            'parts' => array(
+                array( 'text' => $system_prompt ),
+            ),
+        ),
         'contents' => array(
             array(
                 'parts' => array(
@@ -360,7 +462,7 @@ function wcans_suggest_name() {
         $response_body = json_decode( wp_remote_retrieve_body( $response ), true );
 
         if ( 200 !== $response_code ) {
-            $last_error = isset( $response_body['error']['message'] ) ? $response_body['error']['message'] : 'Unknown API error (HTTP ' . $response_code . ')';
+            $last_error = wcans_get_gemini_error_message( $response_body, $response_code );
             continue;
         }
 
@@ -381,11 +483,15 @@ function wcans_suggest_name() {
             break;
         }
 
-        $last_error = 'Model returned an unusable name.';
+        $last_error = empty( $candidate_name ) ? 'The AI returned an empty name response.' : 'The AI returned an invalid name: ' . $candidate_name;
     }
 
     if ( empty( $suggested_name ) ) {
-        wp_send_json_error( 'Couldn\'t come up with a good name from this photo after a few tries — try a clearer or different image, or click Suggest again.' );
+        if ( ! empty( $last_error ) && wcans_is_ai_limit_error( $last_error ) ) {
+            wp_send_json_error( 'AI limit has ended or the API quota has been exhausted. Please try again later.' );
+        }
+
+        wp_send_json_error( ! empty( $last_error ) ? $last_error : 'The AI did not return a valid product name.' );
     }
 
     wp_send_json_success( array( 'name' => $suggested_name ) );
@@ -403,12 +509,10 @@ function wcans_get_names() {
         wp_send_json_error( 'Not allowed' );
     }
 
-    $pending  = get_option( 'wcans_pending_names', array() );
-    $rejected = get_option( 'wcans_rejected_names', array() );
+    $pending = get_option( 'wcans_pending_names', array() );
 
     wp_send_json_success( array(
-        'pending'  => is_array( $pending ) ? array_values( $pending ) : array(),
-        'rejected' => is_array( $rejected ) ? array_values( $rejected ) : array(),
+        'pending' => is_array( $pending ) ? array_values( $pending ) : array(),
     ) );
 }
 
@@ -426,7 +530,7 @@ function wcans_save_name_status() {
     }
 
     $name   = isset( $_POST['name'] ) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '';
-    $status = isset( $_POST['status'] ) ? sanitize_text_field( $_POST['status'] ) : '';
+    $status = isset( $_POST['status'] ) ? sanitize_text_field( wp_unslash( $_POST['status'] ) ) : '';
 
     if ( empty( $name ) || ! in_array( $status, array( 'pending', 'rejected' ), true ) ) {
         wp_send_json_error( 'Invalid data.' );
@@ -443,17 +547,30 @@ function wcans_save_name_status() {
         $list[] = $name;
     }
 
-    $saved = update_option( $option_key, $list, false ); // false = do not autoload, keeps this light on every page load
+    update_option( $option_key, $list, false );
 
-    // update_option() returns false both on failure AND when the new value
-    // is identical to what's already stored (e.g. re-adding a duplicate) —
-    // so we verify by re-reading rather than trusting the return value.
     $verify = get_option( $option_key, array() );
     if ( ! is_array( $verify ) || ! in_array( $name, $verify, true ) ) {
         wp_send_json_error( 'Could not save — please try again.' );
     }
 
     wp_send_json_success( array( 'message' => ( 'pending' === $status ) ? 'Added to Pending Names.' : 'Marked as Rejected.' ) );
+}
+
+add_action( 'wp_ajax_wcans_use_pending_name', 'wcans_use_pending_name' );
+function wcans_use_pending_name() {
+    check_ajax_referer( 'wcans_pending_page_nonce', 'nonce' );
+
+    if ( ! current_user_can( 'edit_products' ) ) {
+        wp_send_json_error( 'Not allowed' );
+    }
+
+    $name = isset( $_POST['name'] ) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '';
+    if ( empty( $name ) ) {
+        wp_send_json_error( 'Invalid name.' );
+    }
+
+    wp_send_json_success( array( 'name' => $name ) );
 }
 
 /**
@@ -468,11 +585,9 @@ function wcans_remove_pending_name() {
     }
 
     $name = isset( $_POST['name'] ) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '';
-    $list = get_option( 'wcans_pending_names', array() );
 
-    if ( is_array( $list ) ) {
-        $list = array_values( array_diff( $list, array( $name ) ) );
-        update_option( 'wcans_pending_names', $list, false );
+    if ( ! wcans_remove_name_from_option( 'wcans_pending_names', $name ) ) {
+        wp_send_json_error( 'Could not remove — please try again.' );
     }
 
     wp_send_json_success();
@@ -490,11 +605,9 @@ function wcans_remove_rejected_name() {
     }
 
     $name = isset( $_POST['name'] ) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '';
-    $list = get_option( 'wcans_rejected_names', array() );
 
-    if ( is_array( $list ) ) {
-        $list = array_values( array_diff( $list, array( $name ) ) );
-        update_option( 'wcans_rejected_names', $list, false );
+    if ( ! wcans_remove_name_from_option( 'wcans_rejected_names', $name ) ) {
+        wp_send_json_error( 'Could not remove — please try again.' );
     }
 
     wp_send_json_success();
@@ -518,13 +631,9 @@ function wcans_add_pending_names_page() {
 }
 
 function wcans_render_pending_names_page() {
-    $pending  = get_option( 'wcans_pending_names', array() );
-    $rejected = get_option( 'wcans_rejected_names', array() );
+    $pending = get_option( 'wcans_pending_names', array() );
     if ( ! is_array( $pending ) ) {
         $pending = array();
-    }
-    if ( ! is_array( $rejected ) ) {
-        $rejected = array();
     }
 
     $nonce = wp_create_nonce( 'wcans_pending_page_nonce' );
@@ -540,7 +649,7 @@ function wcans_render_pending_names_page() {
                 <thead>
                     <tr>
                         <th>Name</th>
-                        <th style="width:160px;">Actions</th>
+                        <th style="width:220px;">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="wcans-pending-list">
@@ -548,32 +657,9 @@ function wcans_render_pending_names_page() {
                         <tr data-name="<?php echo esc_attr( $name ); ?>">
                             <td><?php echo esc_html( $name ); ?></td>
                             <td>
+                                <button type="button" class="button wcans-use-btn" data-name="<?php echo esc_attr( $name ); ?>">Use</button>
                                 <button type="button" class="button wcans-copy-btn" data-name="<?php echo esc_attr( $name ); ?>">Copy</button>
                                 <button type="button" class="button wcans-remove-btn" data-name="<?php echo esc_attr( $name ); ?>" data-list="pending">Remove</button>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php endif; ?>
-
-        <h2 style="margin-top:30px;">Rejected Names <span style="font-weight:normal;font-size:14px;color:#666;">(for reference only)</span></h2>
-        <?php if ( empty( $rejected ) ) : ?>
-            <p><em>No rejected names yet.</em></p>
-        <?php else : ?>
-            <table class="widefat striped" style="max-width:600px;">
-                <thead>
-                    <tr>
-                        <th>Name</th>
-                        <th style="width:80px;">Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="wcans-rejected-list">
-                    <?php foreach ( $rejected as $name ) : ?>
-                        <tr data-name="<?php echo esc_attr( $name ); ?>">
-                            <td><?php echo esc_html( $name ); ?></td>
-                            <td>
-                                <button type="button" class="button wcans-remove-btn" data-name="<?php echo esc_attr( $name ); ?>" data-list="rejected">Remove</button>
                             </td>
                         </tr>
                     <?php endforeach; ?>
@@ -586,6 +672,18 @@ function wcans_render_pending_names_page() {
     jQuery(function ($) {
         var nonce = '<?php echo esc_js( $nonce ); ?>';
 
+        $('.wcans-use-btn').on('click', function () {
+            var name = $(this).data('name');
+            if (!name) {
+                return;
+            }
+
+            if (window.confirm('Use "' + name + '" for the current product title?')) {
+                $('#title').val(name).trigger('change');
+                $('#title').focus();
+            }
+        });
+
         $('.wcans-copy-btn').on('click', function () {
             var name = $(this).data('name');
             if (navigator.clipboard && window.isSecureContext) {
@@ -595,7 +693,6 @@ function wcans_render_pending_names_page() {
                     window.prompt('Copy this name:', name);
                 });
             } else {
-                // Clipboard API needs HTTPS/localhost; fall back to a manual copy prompt.
                 window.prompt('Copy this name:', name);
             }
         });
@@ -603,10 +700,9 @@ function wcans_render_pending_names_page() {
         $('.wcans-remove-btn').on('click', function () {
             var $btn = $(this);
             var name = $btn.data('name');
-            var list = $btn.data('list'); // 'pending' or 'rejected'
-            var action = (list === 'rejected') ? 'wcans_remove_rejected_name' : 'wcans_remove_pending_name';
+            var action = 'wcans_remove_pending_name';
 
-            if (!confirm('Remove "' + name + '" from ' + list + ' names?')) {
+            if (!confirm('Remove "' + name + '" from pending names?')) {
                 return;
             }
             $.post(ajaxurl, {

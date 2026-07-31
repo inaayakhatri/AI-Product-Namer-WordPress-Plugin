@@ -114,8 +114,9 @@ jQuery(function ($) {
     });
 
     var $pendingBtn = $('#wcans-pending-name-btn');
-    var $rejectBtn = $('#wcans-reject-name-btn');
     var $statusMsg = $('#wcans-status-msg');
+    var $showPendingBtn = $('#wcans-show-pending-btn');
+    var $pendingSection = $('#wcans-pending-section');
 
     function saveNameStatus(status) {
         var name = $suggestedText.text();
@@ -150,22 +151,21 @@ jQuery(function ($) {
         saveNameStatus('pending');
     });
 
-    $rejectBtn.on('click', function () {
-        saveNameStatus('rejected');
+    $showPendingBtn.on('click', function () {
+        $pendingSection.show();
     });
 
     /**
-     * Inline pending/rejected lists — loaded and updated in place on the
+     * Inline pending list — loaded and updated in place on the
      * product edit page itself, no navigating to a separate admin page.
      */
     var $pendingList = $('#wcans-pending-inline-list');
-    var $rejectedList = $('#wcans-rejected-inline-list');
 
     function escapeHtml(str) {
         return $('<div>').text(str).html();
     }
 
-    function renderList($container, names, listType) {
+    function renderList($container, names) {
         if (!names || !names.length) {
             $container.html('<p class="wcans-empty-msg" style="color:#666;font-size:12px;">None yet.</p>');
             return;
@@ -177,7 +177,10 @@ jQuery(function ($) {
             rows += '<div class="wcans-inline-row" data-name="' + escapeHtml(name) + '" ' +
                 'style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid #eee;font-size:12px;">' +
                 '<span>' + escapeHtml(name) + '</span>' +
-                '<button type="button" class="button button-small wcans-inline-remove-btn" data-name="' + escapeHtml(name) + '" data-list="' + listType + '">Remove</button>' +
+                '<span style="display:flex;gap:4px;">' +
+                    '<button type="button" class="button button-small wcans-inline-use-btn" data-name="' + escapeHtml(name) + '">Use</button>' +
+                    '<button type="button" class="button button-small wcans-inline-remove-btn" data-name="' + escapeHtml(name) + '">Remove</button>' +
+                '</span>' +
                 '</div>';
         }
         $container.html(rows);
@@ -194,29 +197,60 @@ jQuery(function ($) {
             },
             success: function (response) {
                 if (response.success) {
-                    renderList($pendingList, response.data.pending, 'pending');
-                    renderList($rejectedList, response.data.rejected, 'rejected');
+                    renderList($pendingList, response.data.pending);
                 } else {
                     $pendingList.html('<p style="color:#d63638;font-size:12px;">Could not load.</p>');
-                    $rejectedList.html('<p style="color:#d63638;font-size:12px;">Could not load.</p>');
                 }
             },
             error: function (xhr, status) {
                 var message = (status === 'timeout') ? 'Request timed out. Please refresh and try again.' : 'Could not load.';
                 $pendingList.html('<p style="color:#d63638;font-size:12px;">' + message + '</p>');
-                $rejectedList.html('<p style="color:#d63638;font-size:12px;">' + message + '</p>');
             }
         });
     }
+
+    function setProductTitle(name) {
+        var $titleField = $('#title');
+        if ($titleField.length) {
+            $titleField.val(name).trigger('change');
+            $titleField.focus();
+            return true;
+        }
+
+        var $postTitleField = $('input[name="post_title"], textarea[name="post_title"]');
+        if ($postTitleField.length) {
+            $postTitleField.val(name).trigger('change');
+            $postTitleField.first().focus();
+            return true;
+        }
+
+        if (window.wp && wp.data && wp.data.dispatch && wp.data.select) {
+            var editorStore = wp.data.dispatch('core/editor');
+            if (editorStore && typeof editorStore.editPost === 'function') {
+                editorStore.editPost({ title: name });
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Use button clicks, delegated since rows are rebuilt on every refresh
+    $(document).on('click', '.wcans-inline-use-btn', function () {
+        var name = $(this).data('name');
+        if (!name) {
+            return;
+        }
+        setProductTitle(name);
+    });
 
     // Remove button clicks, delegated since rows are rebuilt on every refresh
     $(document).on('click', '.wcans-inline-remove-btn', function () {
         var $btn = $(this);
         var name = $btn.data('name');
-        var list = $btn.data('list'); // 'pending' or 'rejected'
-        var action = (list === 'rejected') ? 'wcans_remove_rejected_name' : 'wcans_remove_pending_name';
+        var action = 'wcans_remove_pending_name';
 
-        if (!confirm('Remove "' + name + '" from ' + list + ' names?')) {
+        if (!confirm('Remove "' + name + '" from pending names?')) {
             return;
         }
 
