@@ -4,6 +4,10 @@ An AI-powered WordPress/WooCommerce plugin that automatically generates on-brand
 
 Instead of manually naming every new product listing, this plugin looks at the product photo, checks it against the brand's naming history, and suggests a short, brand-consistent name in Roman Urdu/Hindi — with a full human-in-the-loop review flow.
 
+![Demo screenshot](./demo.png)
+
+▶️ [Watch the full demo video](./demo.mp4)
+
 ---
 
 ## Why this exists
