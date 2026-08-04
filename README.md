@@ -113,9 +113,3 @@ This is a live project and open to contributions. Some directions being consider
 - Analytics on suggestion acceptance rate to tune prompting over time
 
 Feedback, issues, and PRs are genuinely welcome.
-
----
-
-## License
-
-Add your preferred license here (e.g. MIT).
